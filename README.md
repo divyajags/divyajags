@@ -3,6 +3,7 @@
 - 🌱 I’m currently learning github
 - 💞️ I’m looking to collaborate with github
 - 📫 You can contact me at anytime
+- fell free to contact
 
 <!---
 divyajags/divyajags is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
