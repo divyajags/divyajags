@@ -1,0 +1,157 @@
+-Sentinel DFDD InC Host Auto-Smash 
+
+Background
+
+DFDD (Discovery and Failure Detection Daemon) is a sidecar process running on most S3 hosts, tracking their health status, with hosts able to be in states such as OK, InC (Incommunicado), Fail, or Forgotten. Currently, manual intervention is required to recover InC hosts through a process called smashing under the 2PR protocol. 
+
+Problem
+
+As S3 Index fleet sizes grow year over year, ensuring consistency requires reliable automation. The RepurposeSentinel workflow, a SMASH-based automation, plays a crucial role in safely repurposing Sentinel hosts . While the exact frequency of InC hosts varies, these hosts typically arise due to patching failures, communication failures or hardware issues. Currently, the recovery process requires manual intervention through smashing under the 2PR protocol, which is time-consuming and prone to errors. This manual approach is not scalable given the growing number of InC hosts, leading to operator bandwidth consumption, operational inefficiencies, and increased downtime. 
+
+Goals
+
+* Automate the smashing of InC hosts after 3 days(Configurable) of continuous InC status. Giving 3 days allows(A host might have recovered or transitioned to other states) resolve without intervention, since few hosts recover in short span in cases like patching rollback, host reboots and temporary network issues  . If we set it too low ~1  day, we risk prematurely smashing hosts that might have recovered
+* Surface hosts that fail the auto-smash after 7 days for operator intervention. If a host fails multiple smash attempts, it could indicate deeper underlying issues. 7 days is to give some time to operators to investigate on bad host issues. Auto-fail kicks in after 10 days of a host being Inc.
+* Ensure fleet health checks are respected to avoid smashing hosts in degraded health states.
+* Limitation on maximum hosts per smash and blast radius. we already have safety checks such as host availability and health verification
+
+In Scope
+
+* Automation - This solution will automate the recovery of InC (Incommunicado) hosts, minimizing manual effort .However, manual intervention will still be required for cases where automated recovery fails
+
+Out of Scope 
+
+* It will only focus on automating the recovery of InC (Incommunicado) hosts, not the broader scope of monitoring for other host states (e.g., Fail, Forgotten) and lemon hosts.
+
+Glossary
+
+* DFDD States: The state of a DFDD record indicating its health:
+    * OK: Host health is good.
+    * InC: Host is experiencing communication failure.
+    * Fail: Manually failed host.
+    * Forgotten: Host in fail state eventually moved to forgotten status after configured forget time.
+* Probe: The Moria component capable of emitting anomalies if a described pattern is found. Currently, Gimli.
+
+Before automation
+
+
+1. Operator manually monitors DFDD dashboard for InC hosts.
+2. Operator checks host status in DFDD and GRNA.
+3. Operator verifies host type (optional).
+4. Operator manually triggers a smash via the CLI (2PR required).
+5. Operator monitors SIRE for workflow status.
+
+Solution
+
+We propose to automate the detection and remediation of InC hosts through the DFDD InC Host Auto-Smash workflow. 
+
+1. Detection: An update in existing AutoSmashProbe will periodically scan DFDD records to identify hosts that have remained InC beyond a configurable threshold (e.g., 3 days). The probe will query the DFDD System for the health status of hosts and filter out those do not meet DFDD-based health validation criteria. 
+2. Response: Once eligible hosts are identified, Gandalf will trigger the AutoSmashWorkflow, which determines whether the InC host should be repurposed. The workflow invokes Samwise/Workflow to execute the RepurposeSentinel activity, updating Sentinel's records accordingly. If a host remains InC for more than 7 days despite automated recovery attempts, PAM will raise an alert, ensuring visibility and further investigation. 
+
+
+
+* AutoSmashProbe periodically scans DFDD records
+* It identifies InC hosts that have been unhealthy beyond a configurable threshold (e.g., 3 days). Giving 3 days allows time to resolve without intervention, since few hosts recover in short span. If we set it too low ~1 we risk prematurely smashing hosts that might have recovered
+* Precondition Check: Ensures host passes DFDD-based health validation.
+* AutoSmashWorkflow verifies eligible hosts for smash.
+* Smash Request: The automation triggers a repurpose action.
+* PAM: Raise alert if a host is Inc for more than 7 days.
+
+
+
+AutoSmashProbe 
+The AutoSmash Probe is designed to monitor the health of hosts (servers or instances) and automate the process of identifying and managing hosts that are in an unhealthy state, specifically those that are marked as "InC" (Incommunicado).
+
+Summary of existing AutoSmashProbe implementation:
+
+* Config
+    * ScanIntervalMillis: how often to run the probe
+    * failureTimeMillis: how long the host has to have failed before emitting anomaly
+    * allowlistedServices: services to run for
+        * Currently enabled for PAM, GRNA, IN, PMS (current users of this probe)
+    * maximumNumberOfAnomaliesPerService: as the name suggests
+    * availabilityPerService: availability threshold per service. If availability is below the threshold, we do not emit anomalies to avoid smashing
+    * availabilityPerAz: stronger config than the config above. If configured, checks against availability of the AZ rather than region
+* Checks
+    * Availability in the region,cell (or zone if configured) must be above threshold
+    * HostHealthPreconditionChecker (checks hardware health via OHA agent) must communicate the host is unhealthy ← we will expand on this criterion to check DFDD health status
+        
+
+Proposal to integrate with DFDD health status for sentinel:
+
+* Implementation
+    * Scans hosts from GRNA and retrieves their health status based on HostHealthPreconditionChecker
+    * Filters hosts that have been failing for more than the min configured time and selects up to configured number of hosts to emit as anomalies
+* Abstract out HostHealthPreconditionChecker as an interface and re-purpose the current health checker as an implementation named HostHardwareHealthChecker which only affects sentinel’s anomaly detection behavior.
+* Update AutoSmashProbe’s instance of HostHealthPreconditionChecker
+    * Currently: a single instance of HostHealthPreconditionChecker
+    * Proposal: Map<ServiceName, PreconditionCheckerImplName> and Map<PreconditionCheckerImplName, PreconditionCheckerInstance>
+    * Goal is to let each service configure what health checker implementation to use and use only one instance of each checker across services
+* Create an implementation of HostHealthPreconditionChecker to check against DFDD status.
+* Only Sentinel will adopt the new DFDD health checks.
+
+Workflow
+
+Summary of existing AutoSmashWorkflow implementation:
+
+* Takes in host endpoint and DFDD app name and passes it to repurposeHost activity
+    * repurposeHost activity defaults to app-specific repurposing workflow if available (mapping code)
+* Calls HostHealthPreconditionChecker.isEligibleForWorkflow (code) to check whether host is unhealthy again before smashing
+
+Proposal to integrate with DFDD health status(incorporating DFDD-based health checks into Sentinel’s Auto-Smash workflow):
+
+* Same update as before - just implement isEligibleForWorkflow for DFDD checker type.
+
+AutoSmashWorkflow steps
+
+#	Workflow Steps	Activity	Activity
+0	Workflow initiated with the following parameters: 
+hostEndpoint (required) - Host to be smashed 
+dfddAppName (required) - DFDD application name 
+chainId (optional) - Specific chain ID if applicable		
+1	Precondition Check	preConditionAutoSmash	Ensures that the host meets DFDD-based health validation criteria before proceeding.
+2	Validate DFDD Status (CHANGE)	validateDfddHealth	New step to verify the host is still in InC state and not transitioning.
+3	Select Repurpose Strategy		
+4	Trigger Auto-Smash	repurposeSentinel	Initiates host repurposing if preconditions are met.
+			
+
+Alternative solutions:
+
+An update in existing AutoSmashProbe will periodically scan DFDD records to identify hosts that have remained InC beyond a configurable threshold of 5 days. PAM raises an alert to notify operator to perform smash manually.
+           Pros:
+            Reduces risk of unnecessary smashes
+           
+           Cons:
+            Manual effort: Still requires manual operator effort, which doesn’t fully solve the problem of operational inefficiency.
+Inconsistent Response Times: Recovery speed depends on how quickly an operator notices and acts on the PAM alert, leading to variability in resolution times
+Scalability Issues: As fleet sizes grow, the number of InC hosts will increase, making manual intervention increasingly unsustainable.
+
+
+Why Our Solution is the Best Choice
+
+Our solution has a structured precondition checks, safety mechanisms, and ability to integrate with Sentinel’s existing workflows which provides a transparent, and scalable approach that eliminates manual delays, ensures fast and consistent host recovery, and keeps Sentinel’s recovery workflow independent from DFDD. It balances automation with maintainability, reducing operator workload without unnecessary dependencies.
+
+
+Pros:
+
+1. Reduces operator workload by automating InC host recovery, eliminating the need for manual intervention. On-call operators currently spend multiple hours per week manually smashing InC hosts. By automating this process, we ensure faster recovery and reducing operational overhead.
+2. Dynamically monitors service availability to ensure that smashing actions do not degrade overall system health, respecting predefined thresholds.
+3. Enables DFDD Auto-Fail by automating the recovery of InC hosts, improving the integrity of DFDD and GRNA records.
+
+Cons:
+
+1. Misconfiguration of thresholds or availability checks may result in unnecessary smashes, potentially affecting service availability.
+    
+    
+    Action Items
+    
+    Discuss with cp-core team about deprecating smash
+    
+    Add probe timing
+     
+    Check the BM to update the probe info
+    
+    carnival alarm - 
+    
+    Notes:
+    Given that we need operator intervention before dfdd auto fail timer (10 days), we should configure this to be a low threshold like 3, and then stop trying/release the lock so that operator can trigger manual workflows
